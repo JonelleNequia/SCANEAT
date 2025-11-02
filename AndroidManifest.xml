@@ -5,8 +5,7 @@
     <application
         android:label="scanet"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher"
-        android:enableOnBackInvokedCallback="true">
+        android:icon="@mipmap/ic_launcher">
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -35,8 +34,8 @@
             android:name="flutterEmbedding"
             android:value="2" />
         <meta-data
-            android:name="OPENAI_API_KEY"
-            android:value="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" />
+            android:name="GEMINI_API_KEY"
+            android:value="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" />
         <meta-data
             android:name="GOOGLE_CSE_KEY"
             android:value="AIzaSyAelI270asWlmXASfrAn-hEMIjtXHa8MYk" />
