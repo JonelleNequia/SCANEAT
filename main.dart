@@ -13,7 +13,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 // ===================== CONFIG (reads Android Manifest via MethodChannel; falls back to --dart-define) =====================
 class AppConfig {
-  static String openAiApiKey = '';
+  static String geminiApiKey = '';
   static String googleCseKey = '';
   static String googleCseCx  = '';
 
@@ -22,26 +22,25 @@ class AppConfig {
   static Future<void> load() async {
     try {
       final meta = await _ch.invokeMethod<Map>('getMeta');
-      openAiApiKey = (meta?['OPENAI_API_KEY'] as String?) ?? '';
+      geminiApiKey = (meta?['GEMINI_API_KEY'] as String?) ?? '';
       googleCseKey = (meta?['GOOGLE_CSE_KEY'] as String?) ?? '';
       googleCseCx  = (meta?['GOOGLE_CSE_CX']  as String?) ?? '';
 
       // ✅ Log key presence for verification (masked for safety)
       debugPrint('[AppConfig] Keys loaded from AndroidManifest:');
-      debugPrint('  OPENAI_API_KEY: ' +
-          (openAiApiKey.isEmpty
-              ? '❌ MISSING'
-              : '✅ SET (' + openAiApiKey.substring(0, 5) + '...' + openAiApiKey.substring(openAiApiKey.length - 4) + ')'));
+      debugPrint('  GEMINI_API_KEY: ' + (geminiApiKey.isEmpty
+          ? '❌ MISSING'
+          : '✅ SET (' + geminiApiKey.substring(0, 5) + '...' + geminiApiKey.substring(geminiApiKey.length - 4) + ')'));
       debugPrint('  GOOGLE_CSE_KEY: ' + (googleCseKey.isEmpty ? '❌ MISSING' : '✅ SET'));
       debugPrint('  GOOGLE_CSE_CX: ' + (googleCseCx.isEmpty ? '❌ MISSING' : '✅ SET'));
     } catch (e) {
       // If MethodChannel fails (e.g., web or iOS), use fallback
-      openAiApiKey = const String.fromEnvironment('OPENAI_API_KEY', defaultValue: '');
+      geminiApiKey = const String.fromEnvironment('GEMINI_API_KEY', defaultValue: '');
       googleCseKey = const String.fromEnvironment('GOOGLE_CSE_KEY', defaultValue: '');
       googleCseCx  = const String.fromEnvironment('GOOGLE_CSE_CX',  defaultValue: '');
 
       debugPrint('[AppConfig] ⚠️ Using fallback (fromEnvironment). Error: $e');
-      debugPrint('  OPENAI_API_KEY: ' + (openAiApiKey.isEmpty ? 'MISSING' : 'SET'));
+      debugPrint('  GEMINI_API_KEY: ' + (geminiApiKey.isEmpty ? 'MISSING' : 'SET'));
     }
   }
 }
@@ -169,74 +168,82 @@ class AppStore {
   }
 }
 
-// ===================== OPENAI HELPERS =====================
+// ===================== GEMINI HELPERS =====================
 Future<List<RecipeCardModel>> generateRecipesFromImage(File imageFile) async {
-  if (AppConfig.openAiApiKey.isEmpty) {
-    debugPrint('[AI] OpenAI key missing – using fallback recipes with Google images.');
+  if (AppConfig.geminiApiKey.isEmpty) {
+    debugPrint('[AI] Gemini key missing – using fallback recipes with Google images.');
     return await _dummyRecipesWithImages();
   }
-  final bytes = await imageFile.readAsBytes();
-  final b64 = base64Encode(bytes);
-
-  final messages = [
-    {
-      'role': 'system',
-      'content': 'You are a culinary assistant for a Filipino audience. Detect ingredients in the provided image and propose 3 Filipino-friendly recipes that use them. Return strict JSON with schema: {"recipes":[{"title":"...","ingredients":[...],"steps":[...],"nutrition":{"kcal":number,"protein_g":number,"fat_g":number,"carbs_g":number,"sodium_mg":number}}]}. No prose.'
-    },
-    {
-      'role': 'user',
-      'content': [
-        {'type': 'text', 'text': 'Analyze this image and produce recipes.'},
+  // If the key looks like an OpenRouter key (e.g., 'sk-or-...'), call Gemini via OpenRouter.
+  if (AppConfig.geminiApiKey.startsWith('sk-')) {
+    try {
+      return await _generateWithOpenRouterGemini(imageFile);
+    } catch (e) {
+      debugPrint('[AI] OpenRouter path failed: $e — falling back to Google Gemini endpoint if possible.');
+      // continue to try Google endpoint below
+    }
+  }
+  try {
+    final bytes = await imageFile.readAsBytes();
+    final b64 = base64Encode(bytes);
+    final uri = Uri.parse('https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${AppConfig.geminiApiKey}');
+    final body = {
+      'contents': [
         {
-          'type': 'image_url',
-          'image_url': {
-            'url': 'data:image/jpeg;base64,$b64'
-          },
-        },
-      ]
+          'parts': [
+            {
+              'text': 'You are a culinary assistant for a Filipino audience. Detect ingredients in the provided image and propose 3 Filipino-friendly recipes that use them. Return strict JSON with schema: {"recipes":[{"title":"...","ingredients":[...],"steps":[...],"nutrition":{"kcal":number,"protein_g":number,"fat_g":number,"carbs_g":number,"sodium_mg":number}}]}. No prose.'
+            },
+            {
+              'inlineData': {
+                'mimeType': 'image/jpeg',
+                'data': b64,
+              }
+            }
+          ]
+        }
+      ],
+      'generationConfig': {
+        'temperature': 0.7,
+        'response_mime_type': 'application/json'
+      }
+    };
+
+    final resp = await http.post(
+      uri,
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode(body),
+    );
+
+    if (resp.statusCode >= 200 && resp.statusCode < 300) {
+      final data = jsonDecode(resp.body) as Map<String, dynamic>;
+      final candidates = data['candidates'] as List?;
+      if (candidates == null || candidates.isEmpty) {
+        return _dummyRecipes();
+      }
+      final text = candidates[0]['content']['parts'][0]['text'] as String;
+      final Map<String, dynamic> parsed = jsonDecode(text);
+      final List recs = parsed['recipes'] ?? [];
+
+      final results = <RecipeCardModel>[];
+      for (final r in recs) {
+        final title = r['title']?.toString() ?? 'Recipe';
+        final imageUrl = await fetchFoodImage(title);
+        results.add(RecipeCardModel(
+          title: title,
+          ingredients: (r['ingredients'] as List?)?.map((e) => e.toString()).toList() ?? [],
+          steps: (r['steps'] as List?)?.map((e) => e.toString()).toList() ?? [],
+          nutrition: r['nutrition'] == null ? null : Map<String, dynamic>.from(r['nutrition']),
+          imageUrl: imageUrl,
+        ));
+      }
+      return results.isEmpty ? _dummyRecipes() : results;
+    } else {
+      debugPrint('Gemini error: ${resp.statusCode} ${resp.body}');
+      return await _dummyRecipesWithImages();
     }
-  ];
-
-  final resp = await http.post(
-    Uri.parse('https://openrouter.ai/api/v1/chat/completions'),
-    headers: {
-      'Authorization': 'Bearer ${AppConfig.openAiApiKey}',
-      'Content-Type': 'application/json',
-      // Recommended by OpenRouter
-      'HTTP-Referer': 'https://github.com/scanet/app',
-      'X-Title': 'Scan Eat (Flutter)',
-    },
-    body: jsonEncode({
-      'model': 'openai/gpt-4o-mini',
-      'messages': messages,
-      'temperature': 0.7,
-      'response_format': {'type': 'json_object'},
-    }),
-  );
-
-  if (resp.statusCode >= 200 && resp.statusCode < 300) {
-    final data = jsonDecode(resp.body) as Map<String, dynamic>;
-    final content = data['choices'][0]['message']['content'];
-    final Map<String, dynamic> parsed = jsonDecode(content);
-    final List recs = parsed['recipes'] ?? [];
-
-    // Attach images per recipe via Google CSE or Unsplash
-    final results = <RecipeCardModel>[];
-    for (final r in recs) {
-      final title = r['title']?.toString() ?? 'Recipe';
-      final imageUrl = await fetchFoodImage(title);
-      results.add(RecipeCardModel(
-        title: title,
-        ingredients: (r['ingredients'] as List?)?.map((e) => e.toString()).toList() ?? [],
-        steps: (r['steps'] as List?)?.map((e) => e.toString()).toList() ?? [],
-        nutrition: r['nutrition'] == null ? null : Map<String, dynamic>.from(r['nutrition']),
-        imageUrl: imageUrl,
-      ));
-    }
-    return results.isEmpty ? _dummyRecipes() : results;
-  } else {
-    debugPrint('OpenAI error: ${resp.statusCode} ${resp.body}');
-    // Try graceful fallback with Google image search so cards still vary & match titles
+  } catch (e) {
+    debugPrint('Gemini network error: $e');
     return await _dummyRecipesWithImages();
   }
 }
@@ -458,7 +465,7 @@ class _AuthPageState extends State<AuthPage> {
                             Expanded(child: Divider(thickness: 1)),
                             SizedBox(width: 8),
                             Text('Or continue with'),
-                            SizedBox(width: 8),
+                            SizedBox (width: 8),
                             Expanded(child: Divider(thickness: 1)),
                           ],
                         ),
@@ -1209,4 +1216,69 @@ Widget _UtensilsStarIcon() {
       ],
     ),
   );
+}
+
+// Uses OpenRouter (OpenAI-compatible) endpoint to call a Gemini model
+Future<List<RecipeCardModel>> _generateWithOpenRouterGemini(File imageFile) async {
+  // Uses OpenRouter (OpenAI-compatible) endpoint to call a Gemini model
+  final bytes = await imageFile.readAsBytes();
+  final b64 = base64Encode(bytes);
+  final dataUrl = 'data:image/jpeg;base64,$b64';
+
+  final uri = Uri.parse('https://openrouter.ai/api/v1/chat/completions');
+  final messages = [
+    {
+      'role': 'system',
+      'content':
+          'You are a culinary assistant for a Filipino audience. Detect ingredients in the provided image and propose 3 Filipino-friendly recipes that use them. Return strict JSON with schema: {"recipes":[{"title":"...","ingredients":[...],"steps":[...],"nutrition":{"kcal":number,"protein_g":number,"fat_g":number,"carbs_g":number,"sodium_mg":number}}]}. No prose.'
+    },
+    {
+      'role': 'user',
+      'content': [
+        {'type': 'text', 'text': 'Analyze this image and produce recipes.'},
+        {'type': 'image_url', 'image_url': {'url': dataUrl}},
+      ]
+    }
+  ];
+
+  final resp = await http.post(
+    uri,
+    headers: {
+      'Authorization': 'Bearer ${AppConfig.geminiApiKey}',
+      'Content-Type': 'application/json',
+      'HTTP-Referer': 'https://github.com/scanet/app',
+      'X-Title': 'Scan Eat (Flutter)',
+    },
+    body: jsonEncode({
+      // Pick a Gemini model available on OpenRouter
+      'model': 'google/gemini-2.0-flash-001',
+      'messages': messages,
+      'temperature': 0.7,
+      'response_format': {'type': 'json_object'},
+    }),
+  );
+
+  if (resp.statusCode >= 200 && resp.statusCode < 300) {
+    final data = jsonDecode(resp.body) as Map<String, dynamic>;
+    final content = data['choices'][0]['message']['content'];
+    final Map<String, dynamic> parsed = jsonDecode(content);
+    final List recs = parsed['recipes'] ?? [];
+
+    final results = <RecipeCardModel>[];
+    for (final r in recs) {
+      final title = r['title']?.toString() ?? 'Recipe';
+      final imageUrl = await fetchFoodImage(title);
+      results.add(RecipeCardModel(
+        title: title,
+        ingredients: (r['ingredients'] as List?)?.map((e) => e.toString()).toList() ?? [],
+        steps: (r['steps'] as List?)?.map((e) => e.toString()).toList() ?? [],
+        nutrition: r['nutrition'] == null ? null : Map<String, dynamic>.from(r['nutrition']),
+        imageUrl: imageUrl,
+      ));
+    }
+    return results.isEmpty ? _dummyRecipes() : results;
+  } else {
+    debugPrint('[OpenRouter] HTTP ${resp.statusCode}: ${resp.body}');
+    return _dummyRecipes();
+  }
 }
