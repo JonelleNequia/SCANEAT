@@ -20,7 +20,7 @@ class MainActivity : FlutterActivity() {
                         )
                         val meta = appInfo.metaData
                         val map = hashMapOf<String, Any?>()
-                        map["OPENAI_API_KEY"] = meta?.getString("OPENAI_API_KEY")
+                        map["GEMINI_API_KEY"] = meta?.getString("GEMINI_API_KEY")
                         map["GOOGLE_CSE_KEY"] = meta?.getString("GOOGLE_CSE_KEY")
                         map["GOOGLE_CSE_CX"]  = meta?.getString("GOOGLE_CSE_CX")
                         result.success(map)
